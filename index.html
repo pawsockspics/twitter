@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Pawsocks</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { width: 100%; height: 100%; -webkit-text-size-adjust: 100%; }
+  body {
+    width: 100%; min-height: 100%; background: #0b0b0c; color: #eaeaea;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  }
+  @media (min-width: 768px) { body { zoom: 1.25; } }
+  #search {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 20; display: flex; gap: 6px;
+    padding: 8px; background: rgba(11, 11, 12, 0.92); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  }
+  #search input {
+    flex: 1; min-width: 0; font: inherit; font-size: 16px; color: #eaeaea; background: #1a1a1d;
+    border: 1px solid #2a2a2e; border-radius: 8px; padding: 8px 10px; outline: none;
+  }
+  #search input:focus { border-color: #555; }
+  #search button {
+    font: inherit; font-size: 15px; color: #0b0b0c; background: #eaeaea; border: 0;
+    border-radius: 8px; padding: 0 14px; cursor: pointer;
+  }
+  #status[hidden] { display: none; }
+  #status {
+    position: fixed; inset: 54px 0 0 0; display: flex; align-items: center; justify-content: center;
+    font-size: 0.95rem; letter-spacing: 0.02em; color: #999; text-align: center;
+    padding: 1.5rem; z-index: 10; background: #0b0b0c;
+  }
+  #gallery { width: 100%; line-height: 0; padding-top: 54px; padding-bottom: 80px; }
+  #gallery .row { display: flex; width: 100%; overflow: hidden; }
+  #gallery .row.new { animation: galleryFade 0.35s ease both; }
+  #gallery a {
+    display: block; line-height: 0; flex-shrink: 0; overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #gallery img { display: block; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+  #loader {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    font-size: 0.78rem; color: #666; letter-spacing: 0.03em; pointer-events: none;
+    opacity: 0; transition: opacity 0.2s; z-index: 5; white-space: nowrap;
+  }
+  #loader.visible { opacity: 1; }
+  #loader.action { pointer-events: auto; cursor: pointer; color: #aaa; }
+  @keyframes galleryFade {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+</style>
+</head>
+<body>
+<form id="search" role="search">
+  <input id="q" type="search" name="q" placeholder="search, @username or @username search" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button type="submit">go</button>
+</form>
+<div id="status">loading</div>
+<div id="gallery"></div>
+<div id="loader">loading more…</div>
+
+<script>
+(function () {
+  const API        = "https://twitter.pawsocks.pics/v1/images";
+  const PAGE_LIMIT = 30;            // images per request (max 50). Rate limit is 2000 images/min per IP.
+  const PREFETCH   = 900;           // px from bottom before the next page is requested
+
+  // Image ids to never show (X media ids, e.g. "HVcx3IHXUAAFDsN")
+  const BLACKLIST = new Set([]);
+
+  const TARGET_ROW_H = () => {
+    const h = window.innerHeight;
+    if (window.innerWidth < 768) return Math.max(120, Math.min(200, Math.round(h * 0.22)));
+    return Math.max(160, Math.min(260, Math.round(h * 0.26)));
+  };
+
+  const pool = [];
+  const seen = new Set(BLACKLIST);
+  let rendered = 0;
+  let rowH = TARGET_ROW_H();
+  let lastWidth = window.innerWidth;
+
+  // What to search: from the box, or ?q= in this page's address
+  let query = (new URLSearchParams(location.search).get("q") || "").trim();
+
+  // Pagination state. `generation` changes on every new search, so answers
+  // to an older search that arrive late are dropped.
+  let page = 1, generation = 0;
+  let finished = false;             // has_more was false: everything has been seen
+  let loading = false;
+  let blockedUntil = 0;             // ms timestamp; don't call the API before this
+
+  const statusEl  = document.getElementById("status");
+  const formEl    = document.getElementById("search");
+  const inputEl   = document.getElementById("q");
+  const galleryEl = document.getElementById("gallery");
+  const loaderEl  = document.getElementById("loader");
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // ── API ──────────────────────────────────────────────────────────────────────
+  async function fetchPage() {
+    const q = new URLSearchParams({ q: query, limit: PAGE_LIMIT, page });
+    const gen = generation;
+    const res = await fetch(`${API}?${q}`);
+    if (gen !== generation) throw Object.assign(new Error("stale"), { stale: true });
+
+    // Rate limited, or too many new searches at once: wait for Retry-After
+    if (res.status === 429 || res.status === 503) {
+      const wait = Number(res.headers.get("Retry-After") || 5);
+      blockedUntil = Date.now() + wait * 1000;
+      throw Object.assign(new Error("rate limited"), { rateLimited: true, wait });
+    }
+    if (!res.ok) {
+      // The API explains bad searches (e.g. "@" with no username); show that
+      const body = await res.json().catch(() => null);
+      throw Object.assign(new Error("HTTP " + res.status), { apiMessage: body?.error?.message });
+    }
+
+    // Not enough budget left for another full page? Pause until the counter resets.
+    const remaining = Number(res.headers.get("X-RateLimit-Remaining"));
+    const reset     = Number(res.headers.get("X-RateLimit-Reset"));
+    if (Number.isFinite(remaining) && remaining < PAGE_LIMIT && reset) {
+      blockedUntil = reset * 1000;
+    }
+
+    const json = await res.json();
+    if (gen !== generation) throw Object.assign(new Error("stale"), { stale: true });
+    const p = json.pagination;
+    if (p.has_more) page = p.next_page; else finished = true;
+    return json.data || [];
+  }
+
+  // HEIC doesn't display in most browsers, so skip those images entirely
+  const isHeic = u => /\.heic?(\?|#|$)/i.test(u || "");
+
+  function addToPool(items) {
+    let added = 0;
+    for (const it of items) {
+      if (!it || seen.has(it.id)) continue;
+      if (isHeic(it.url) || isHeic(it.thumbnail)) { seen.add(it.id); continue; }
+      seen.add(it.id);
+      pool.push({
+        id: it.id,
+        thumb: it.thumbnail || it.url,
+        url: it.url,
+        aspect: it.aspect || (it.width / it.height) || 1
+      });
+      added++;
+    }
+    return added;
+  }
+
+  // ── Layout ───────────────────────────────────────────────────────────────────
+  // Justified rows built from the aspect ratios the API gives us, so no image
+  // has to be preloaded to measure it. A trailing partial row waits for more
+  // images, unless `flush` is set (nothing more is coming).
+  function appendRows(fromIndex, maxImages, flush) {
+    const available = pool.slice(fromIndex, fromIndex + maxImages);
+    if (!available.length) return 0;
+    const containerWidth = galleryEl.clientWidth || window.innerWidth;
+    if (containerWidth <= 0) return 0;
+
+    const rows = [];
+    let cur = [], sumAspect = 0, used = 0;
+    for (const item of available) {
+      cur.push(item); sumAspect += item.aspect; used++;
+      if (sumAspect * rowH >= containerWidth * 0.98) {
+        rows.push({ items: cur, aspectSum: sumAspect });
+        cur = []; sumAspect = 0;
+      }
+    }
+    if (flush && cur.length) {
+      rows.push({ items: cur, aspectSum: Math.max(sumAspect, containerWidth / rowH) });
+      cur = [];
+    }
+
+    rows.forEach(row => {
+      const rh    = containerWidth / row.aspectSum;
+      const rowEl = document.createElement("div");
+      rowEl.className    = "row new";
+      rowEl.style.height = Math.floor(rh) + "px";
+
+      row.items.forEach(item => {
+        const link = document.createElement("a");
+        link.href   = item.url;
+        link.target = "_blank";
+        link.rel    = "noopener";
+        link.style.width  = Math.floor(item.aspect * rh) + "px";
+        link.style.height = Math.floor(rh) + "px";
+        const img = document.createElement("img");
+        img.src      = item.thumb;
+        img.alt      = "pawsocks";
+        img.loading  = "lazy";
+        img.decoding = "async";
+        img.onerror  = () => { if (img.src !== item.url) img.src = item.url; };
+        link.appendChild(img);
+        rowEl.appendChild(link);
+      });
+
+      // Pixel-perfect fill: absorb rounding error into the last cell (full rows only)
+      const links = rowEl.querySelectorAll("a");
+      if (links.length && Math.abs(row.aspectSum * rh - containerWidth) < 1) {
+        let total = 0;
+        links.forEach(a => total += parseInt(a.style.width, 10));
+        const diff = containerWidth - total;
+        if (diff !== 0) {
+          const last = links[links.length - 1];
+          last.style.width = (parseInt(last.style.width, 10) + diff) + "px";
+        }
+      }
+      galleryEl.appendChild(rowEl);
+    });
+
+    return used - cur.length;
+  }
+
+  function revealAvailable() {
+    if (rendered >= pool.length) return 0;
+    const n = appendRows(rendered, pool.length - rendered, finished);
+    rendered += n;
+    return n;
+  }
+
+  // ── Loading cycle ────────────────────────────────────────────────────────────
+  function showLoader(text, action) {
+    loaderEl.textContent = text;
+    loaderEl.classList.add("visible");
+    loaderEl.classList.toggle("action", !!action);
+  }
+  function hideLoader() { loaderEl.classList.remove("visible", "action"); }
+
+  async function cycle() {
+    if (loading || finished) return false;
+    const wait = blockedUntil - Date.now();
+    if (wait > 0) {
+      showLoader("cooling down for a moment…");
+      await sleep(wait + 200);
+    }
+    loading = true;
+    showLoader("loading more…");
+    let ok = false;
+    const gen = generation;
+    try {
+      addToPool(await fetchPage());
+      revealAvailable();
+      ok = true;
+    } catch (e) {
+      if (e.stale) return false;
+      console.warn("fetch failed", e);
+      if (e.rateLimited) showLoader("slow down a little — retrying…");
+    } finally {
+      if (gen === generation) {
+        loading = false;
+        if (finished) showEnd(); else if (ok) hideLoader();
+      }
+    }
+    return ok;
+  }
+
+  function showEnd() {
+    showLoader(rendered ? "that's all of them · tap to start over" : "no photos found", !!rendered);
+  }
+
+  // Forget everything shown so far (new search, or starting over)
+  function reset() {
+    generation++;
+    page = 1; finished = false; loading = false;
+    pool.length = 0; seen.clear(); BLACKLIST.forEach(id => seen.add(id));
+    rendered = 0;
+    galleryEl.innerHTML = "";
+    window.scrollTo(0, 0);
+    hideLoader();
+  }
+
+  loaderEl.addEventListener("click", () => {
+    if (!finished || !rendered) return;
+    reset();
+    fillScreen();
+  });
+
+  formEl.addEventListener("submit", e => {
+    e.preventDefault();
+    query = inputEl.value.trim();
+    inputEl.blur();
+    const url = new URL(location.href);
+    if (query) url.searchParams.set("q", query); else url.searchParams.delete("q");
+    history.replaceState(null, "", url);
+    reset();
+    init();
+  });
+
+  // Keep requesting until the page is comfortably taller than the screen
+  async function fillScreen() {
+    let guard = 0;
+    while (!finished && guard++ < 6 &&
+           document.documentElement.scrollHeight < window.innerHeight * 2.5) {
+      const ok = await cycle();
+      if (!ok) await sleep(1500);
+    }
+  }
+
+  function fullRelayout() {
+    const scrollRatio = document.documentElement.scrollHeight > 0
+      ? window.pageYOffset / document.documentElement.scrollHeight : 0;
+    rowH = TARGET_ROW_H();
+    galleryEl.innerHTML = "";
+    const prev = rendered; rendered = 0;
+    while (rendered < prev) {
+      const n = appendRows(rendered, 30, finished && rendered + 30 >= pool.length);
+      if (!n) break;
+      rendered += n;
+    }
+    requestAnimationFrame(() => window.scrollTo(0, scrollRatio * document.documentElement.scrollHeight));
+  }
+
+  window.addEventListener("resize", () => {
+    if (window.innerWidth === lastWidth) return;
+    lastWidth = window.innerWidth;
+    clearTimeout(window.__rt);
+    window.__rt = setTimeout(fullRelayout, 150);
+  });
+  window.addEventListener("orientationchange", () => {
+    lastWidth = window.innerWidth;
+    clearTimeout(window.__rt);
+    window.__rt = setTimeout(fullRelayout, 250);
+  });
+
+  function onScroll() {
+    if (loading || finished) return;
+    const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+    const docH      = document.documentElement.scrollHeight;
+    if (docH - scrollTop - window.innerHeight < PREFETCH) cycle();
+  }
+
+  function showStatus(text, retry) {
+    statusEl.hidden = false;
+    statusEl.textContent = text;
+    statusEl.style.cursor = retry ? "pointer" : "";
+    statusEl.onclick = retry ? () => { statusEl.onclick = null; init(); } : null;
+  }
+
+  async function init() {
+    inputEl.value = query;
+    rowH = TARGET_ROW_H(); lastWidth = window.innerWidth;
+    if (!query) {
+      // No default search: the API needs one
+      showStatus("error: search query needed — type a search, @username, or @username search above");
+      return;
+    }
+    showStatus("loading");
+    let ok = false, message = null;
+    const gen = generation;
+    loading = true;
+    try {
+      addToPool(await fetchPage());
+      revealAvailable();
+      ok = true;
+    } catch (e) {
+      if (e.stale) return;
+      console.warn("fetch failed", e);
+      message = e.apiMessage || (e.rateLimited ? `busy right now — tap to retry in ${e.wait}s` : null);
+    } finally {
+      if (gen === generation) loading = false;
+    }
+    if (!ok) {
+      showStatus(message || "couldn't reach the pawsocks API — tap to retry", true);
+      return;
+    }
+    statusEl.hidden = true;
+    if (finished) showEnd();
+    await fillScreen();
+  }
+
+  window.addEventListener("scroll", onScroll, { passive: true });
+  init();
+})();
+</script>
+</body>
+</html>
