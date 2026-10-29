@@ -88,7 +88,8 @@
 
   // Pagination state. `generation` changes on every new search, so answers
   // to an older search that arrive late are dropped.
-  let page = 1, generation = 0;
+  // `offset` is how many results have been read so far (the API's next_offset).
+  let offset = 0, generation = 0;
   let finished = false;             // API said has_more: false (X has no more results, or the Worker's page cap)
   let loading = false;
   let blockedUntil = 0;             // ms timestamp; don't call the API before this
@@ -104,7 +105,7 @@
 
   // ── API ──────────────────────────────────────────────────────────────────────
   async function fetchPage() {
-    const q = new URLSearchParams({ q: query, limit: PAGE_LIMIT, page });
+    const q = new URLSearchParams({ q: query, limit: PAGE_LIMIT, offset });
     const gen = generation;
     const res = await fetch(`${API}?${q}`);
     if (gen !== generation) throw Object.assign(new Error("stale"), { stale: true });
@@ -131,7 +132,8 @@
     const json = await res.json();
     if (gen !== generation) throw Object.assign(new Error("stale"), { stale: true });
     const p = json.pagination;
-    if (p.has_more) page = p.next_page; else finished = true;
+    // next_offset continues right after this page, even when it came back short
+    if (p.has_more) offset = p.next_offset; else finished = true;
     return json.data || [];
   }
 
@@ -291,7 +293,7 @@
   function reset() {
     generation++;
     clearTimeout(retryTimer);
-    page = 1; finished = false; loading = false;
+    offset = 0; finished = false; loading = false;
     pool.length = 0; seen.clear(); BLACKLIST.forEach(id => seen.add(id));
     rendered = 0;
     galleryEl.innerHTML = "";
