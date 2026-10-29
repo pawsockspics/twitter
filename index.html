@@ -47,7 +47,6 @@
     opacity: 0; transition: opacity 0.2s; z-index: 5; white-space: nowrap;
   }
   #loader.visible { opacity: 1; }
-  #loader.action { pointer-events: auto; cursor: pointer; color: #aaa; }
   @keyframes galleryFade {
     from { opacity: 0; transform: translateY(8px); }
     to   { opacity: 1; transform: translateY(0); }
@@ -90,9 +89,10 @@
   // Pagination state. `generation` changes on every new search, so answers
   // to an older search that arrive late are dropped.
   let page = 1, generation = 0;
-  let finished = false;             // has_more was false: everything has been seen
+  let finished = false;             // API said has_more: false (X has no more results, or the Worker's page cap)
   let loading = false;
   let blockedUntil = 0;             // ms timestamp; don't call the API before this
+  let retryTimer = null;
 
   const statusEl  = document.getElementById("status");
   const formEl    = document.getElementById("search");
@@ -148,6 +148,7 @@
         id: it.id,
         thumb: it.thumbnail || it.url,
         url: it.url,
+        post: it.post_url || it.url,   // the original X post
         aspect: it.aspect || (it.width / it.height) || 1
       });
       added++;
@@ -187,7 +188,7 @@
 
       row.items.forEach(item => {
         const link = document.createElement("a");
-        link.href   = item.url;
+        link.href   = item.post;
         link.target = "_blank";
         link.rel    = "noopener noreferrer";
         link.referrerPolicy = "no-referrer";
@@ -228,13 +229,26 @@
     return n;
   }
 
-  // ── Loading cycle ────────────────────────────────────────────────────────────
-  function showLoader(text, action) {
+  // ── Loading cycle (infinite scroll) ──────────────────────────────────────────
+  function showLoader(text) {
     loaderEl.textContent = text;
     loaderEl.classList.add("visible");
-    loaderEl.classList.toggle("action", !!action);
   }
-  function hideLoader() { loaderEl.classList.remove("visible", "action"); }
+  function hideLoader() { loaderEl.classList.remove("visible"); }
+
+  // Load more if the bottom of the page is near
+  function maybeLoad() {
+    if (loading || finished) return;
+    const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+    const docH      = document.documentElement.scrollHeight;
+    if (docH - scrollTop - window.innerHeight < PREFETCH) cycle();
+  }
+
+  function scheduleRetry(ms) {
+    clearTimeout(retryTimer);
+    const gen = generation;
+    retryTimer = setTimeout(() => { if (gen === generation) maybeLoad(); }, ms);
+  }
 
   async function cycle() {
     if (loading || finished) return false;
@@ -255,22 +269,28 @@
       if (e.stale) return false;
       console.warn("fetch failed", e);
       if (e.rateLimited) showLoader("slow down a little — retrying…");
+      else showLoader("couldn't load more — retrying…");
+      scheduleRetry(e.rateLimited ? (e.wait * 1000 + 300) : 4000);
     } finally {
       if (gen === generation) {
         loading = false;
-        if (finished) showEnd(); else if (ok) hideLoader();
+        if (finished) showEnd();
+        else if (ok) { hideLoader(); setTimeout(maybeLoad, 50); }
       }
     }
     return ok;
   }
 
+  // Only shown when the API itself said there is nothing more (has_more: false).
+  // Rate limiting never ends up here: it shows "cooling down" / "slow down" and retries.
   function showEnd() {
-    showLoader(rendered ? "that's all of them · tap to start over" : "no photos found", !!rendered);
+    showLoader(rendered ? `end of results (${rendered} shown)` : "no photos found");
   }
 
-  // Forget everything shown so far (new search, or starting over)
+  // Forget everything shown so far (new search)
   function reset() {
     generation++;
+    clearTimeout(retryTimer);
     page = 1; finished = false; loading = false;
     pool.length = 0; seen.clear(); BLACKLIST.forEach(id => seen.add(id));
     rendered = 0;
@@ -278,12 +298,6 @@
     window.scrollTo(0, 0);
     hideLoader();
   }
-
-  loaderEl.addEventListener("click", () => {
-    if (!finished || !rendered) return;
-    reset();
-    fillScreen();
-  });
 
   formEl.addEventListener("submit", e => {
     e.preventDefault();
@@ -332,13 +346,6 @@
     window.__rt = setTimeout(fullRelayout, 250);
   });
 
-  function onScroll() {
-    if (loading || finished) return;
-    const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-    const docH      = document.documentElement.scrollHeight;
-    if (docH - scrollTop - window.innerHeight < PREFETCH) cycle();
-  }
-
   function showStatus(text, retry) {
     statusEl.hidden = false;
     statusEl.textContent = text;
@@ -378,7 +385,7 @@
     await fillScreen();
   }
 
-  window.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("scroll", maybeLoad, { passive: true });
   init();
 })();
 </script>
